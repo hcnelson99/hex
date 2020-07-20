@@ -1,0 +1,6 @@
+(lang dune 2.1)
+(profile dev)
+(env
+  (dev
+    (flags (:standard -warn-error -A))))
+
