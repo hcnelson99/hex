@@ -1,6 +1,6 @@
 open Core
 
-let board_size = 5
+let board_size = 11
 
 module Hex : sig
   type t [@@deriving sexp, hash, compare]
@@ -102,11 +102,15 @@ module Board : sig
       | X
       | O
     [@@deriving equal, compare]
+
+    val to_string : t -> string
   end
 
   val starting_board : t
   val to_string : t -> string
   val make_move : t -> Hex.t -> [ `Invalid_move | `Next_board of t | `Move_won of t ]
+  val turn : t -> Turn.t
+  val random_move : t -> Hex.t
 end = struct
   module Turn = struct
     type t =
@@ -130,6 +134,7 @@ end = struct
     ; board : Turn.t Hex.Map.t
     }
 
+  let turn { turn; board = _ } = turn
   let starting_board = { turn = Turn.X; board = Hex.Map.empty }
   let repeat s ~count = List.init count ~f:(fun _ -> s) |> String.concat
 
@@ -222,30 +227,63 @@ end = struct
       else `Next_board { board; turn = Turn.flip turn }
     | Some _ -> `Invalid_move
   ;;
+
+  let moves { board; turn = _ } =
+    List.init board_size ~f:(fun row ->
+        List.init board_size ~f:(fun col -> Hex.of_row_col_exn ~row ~col))
+    |> List.concat
+    |> List.filter_map ~f:(fun hex ->
+           match Map.find board hex with
+           | None -> Some hex
+           | Some _ -> None)
+  ;;
+
+  let random_choice l =
+    let i = Random.int (List.length l) in
+    List.nth_exn l i
+  ;;
+
+  let random_move t = random_choice (moves t)
 end
 
-let rec get_move () =
+module MCTS = struct
+  module Node = struct
+    type t =
+      { board : Board.t
+      ; wins : int
+      ; simulations : int
+      }
+  end
+end
+
+let rec human_player board =
+  print_string (Board.Turn.to_string (Board.turn board) ^ ": ");
+  Out_channel.flush stdout;
   match
     In_channel.input_line In_channel.stdin |> Option.value_exn |> Hex.of_move_string
   with
   | Some move -> move
-  | None -> get_move ()
+  | None ->
+    print_endline "Invalid move. Try again.";
+    human_player board
 ;;
 
 let play () =
-  let rec go board =
+  let rec go ~x_player ~o_player board =
     print_endline (Board.to_string board);
-    let move = get_move () in
+    let move =
+      match Board.turn board with
+      | Board.Turn.X -> x_player board
+      | Board.Turn.O -> o_player board
+    in
     match Board.make_move board move with
-    | `Invalid_move ->
-      print_endline "Invalid move";
-      go board
-    | `Next_board board' -> go board'
+    | `Invalid_move -> failwith "Invalid move"
+    | `Next_board board' -> go ~x_player ~o_player board'
     | `Move_won board ->
       print_endline (Board.to_string board);
-      print_endline "Player won!"
+      print_endline ("Player " ^ Board.Turn.to_string (Board.turn board) ^ " won!")
   in
-  go Board.starting_board
+  go ~x_player:Board.random_move ~o_player:Board.random_move Board.starting_board
 ;;
 
 let main () = play ()
