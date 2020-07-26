@@ -1,6 +1,7 @@
 open Core
 
-let board_size = 11
+(* TODO: Make this be a module argument? *)
+let board_size = 5
 
 module Hex : sig
   type t [@@deriving sexp, hash, compare]
@@ -86,10 +87,10 @@ let%expect_test _ =
   |> List.iter ~f:print_endline;
   [%expect
     {|
-    c3 -> (3 2)
-    a4 -> (4 0)
-    b2 -> (2 1)
-    d1 -> (1 3)
+    c3 -> (2 2)
+    a4 -> (3 0)
+    b2 -> (1 1)
+    d1 -> (0 3)
     %3 -> fail
     a100 -> fail |}]
 ;;
@@ -106,10 +107,22 @@ module Board : sig
     val to_string : t -> string
   end
 
+  module Won_board : sig
+    type t
+
+    val to_string : t -> string
+  end
+
   val starting_board : t
   val to_string : t -> string
-  val make_move : t -> Hex.t -> [ `Invalid_move | `Next_board of t | `Move_won of t ]
+
+  val make_move
+    :  t
+    -> Hex.t
+    -> [ `Invalid_move | `Next_board of t | `Winner of Turn.t * Won_board.t ]
+
   val turn : t -> Turn.t
+  val moves : t -> Hex.t list
   val random_move : t -> Hex.t
 end = struct
   module Turn = struct
@@ -138,8 +151,8 @@ end = struct
   let starting_board = { turn = Turn.X; board = Hex.Map.empty }
   let repeat s ~count = List.init count ~f:(fun _ -> s) |> String.concat
 
-  let to_string { board; turn } =
-    (Turn.to_string turn ^ "'s turn -- O goes from top to bottom")
+  let board_to_string board =
+    "O goes from top to bottom"
     :: ("   "
        ^ ("abcdefghijklmnopqrstuvwxyz"
          |> String.sub ~pos:0 ~len:board_size
@@ -159,6 +172,16 @@ end = struct
                     display ^ "   ")))
     |> String.concat ~sep:"\n"
   ;;
+
+  let to_string { turn; board } =
+    Turn.to_string turn ^ "'s turn -- " ^ board_to_string board
+  ;;
+
+  module Won_board = struct
+    type t = Turn.t Hex.Map.t
+
+    let to_string = board_to_string
+  end
 
   let%expect_test _ =
     let example_board =
@@ -223,7 +246,7 @@ end = struct
     | None ->
       let board = Map.set board ~key:hex ~data:turn in
       if has_won ~player:turn board
-      then `Move_won { board; turn }
+      then `Winner (turn, board)
       else `Next_board { board; turn = Turn.flip turn }
     | Some _ -> `Invalid_move
   ;;
@@ -243,18 +266,149 @@ end = struct
     List.nth_exn l i
   ;;
 
-  let random_move t = random_choice (moves t)
+  let random_move t = List.random_element_exn (moves t)
 end
 
 module MCTS = struct
-  module Node = struct
-    type t =
-      { board : Board.t
-      ; wins : int
-      ; simulations : int
-      }
-  end
+  type node_data =
+    | UpperConfidenceBound of { children : t list }
+    | MonteCarlo of
+        { board : Board.t
+        ; unexplored_moves : Hex.t list
+        ; explored_moves : t list
+        }
+
+  and t =
+    { wins : int
+    ; simulations : int
+    ; move : Hex.t option
+    ; turn : Board.Turn.t
+    ; node_data : node_data
+    }
+
+  let create ?move board =
+    { wins = 0
+    ; simulations = 0
+    ; move
+    ; turn = Board.turn board
+    ; node_data =
+        MonteCarlo { board; unexplored_moves = Board.moves board; explored_moves = [] }
+    }
+  ;;
+
+  let rec rollout board =
+    let move = Board.random_move board in
+    match Board.make_move board move with
+    | `Invalid_move -> assert false
+    | `Winner (winner, _) -> winner
+    | `Next_board next -> rollout next
+  ;;
+
+  let update_node t ~winner =
+    { t with
+      simulations = t.simulations + 1
+    ; wins = (t.wins + if Board.Turn.equal t.turn winner then 1 else 0)
+    }
+  ;;
+
+  let max_by_exn l ~score ~greater =
+    let rec go (max, max_score, seen, l) =
+      match l with
+      | [] -> max, seen
+      | x :: l ->
+        let score = score x in
+        if greater score max_score
+        then go (x, score, max :: seen, l)
+        else go (max, max_score, x :: seen, l)
+    in
+    match l with
+    | [] -> assert false
+    | max :: l ->
+      let max_score = score max in
+      go (max, max_score, [], l)
+  ;;
+
+  let rec iterate' { wins; simulations; move; turn; node_data } =
+    match node_data with
+    | MonteCarlo { board; unexplored_moves; explored_moves } ->
+      (match unexplored_moves with
+      | [] ->
+        iterate'
+          { wins
+          ; simulations
+          ; move
+          ; turn
+          ; node_data = UpperConfidenceBound { children = explored_moves }
+          }
+      | move :: unexplored_moves ->
+        (match Board.make_move board move with
+        | `Invalid_move -> assert false
+        | `Winner (winner, _) ->
+          (* If a move off our board won, we know our opponent won so just
+           * increment the simulation count *)
+          ( { wins
+            ; simulations
+            ; move = Some move
+            ; turn
+            ; node_data = MonteCarlo { board; unexplored_moves; explored_moves }
+            }
+            |> update_node ~winner
+          , winner )
+        | `Next_board child_board ->
+          let winner = rollout child_board in
+          let explored_move = child_board |> create |> update_node ~winner in
+          ( { wins
+            ; simulations
+            ; move = Some move
+            ; turn
+            ; node_data =
+                MonteCarlo
+                  { board
+                  ; unexplored_moves
+                  ; explored_moves = explored_move :: explored_moves
+                  }
+            }
+            |> update_node ~winner
+          , winner )))
+    | UpperConfidenceBound { children } ->
+      let score_child node =
+        Float.(
+          (of_int node.wins / of_int node.simulations)
+          + (sqrt (of_int 2) * sqrt (log (of_int simulations) / of_int node.simulations)))
+      in
+      let best_child, children =
+        max_by_exn children ~score:score_child ~greater:Float.( > )
+      in
+      let best_child, winner = iterate' best_child in
+      ( { wins
+        ; simulations
+        ; move
+        ; turn
+        ; node_data = UpperConfidenceBound { children = best_child :: children }
+        }
+        |> update_node ~winner
+      , winner )
+  ;;
+
+  let iterate t = iterate' t |> fst
+
+  let best_move { node_data; _ } =
+    match node_data with
+    | MonteCarlo _ -> failwith "Not enough simulations"
+    | UpperConfidenceBound { children } ->
+      let best_move, _ =
+        max_by_exn children ~score:(fun node -> node.simulations) ~greater:Int.( > )
+      in
+      best_move.move |> Option.value_exn
+  ;;
 end
+
+let mcts_player board =
+  let rec go mcts i =
+    if i = 100000 then MCTS.best_move mcts else go (MCTS.iterate mcts) (i + 1)
+  in
+  go (MCTS.create board) 0
+;;
 
 let rec human_player board =
   print_string (Board.Turn.to_string (Board.turn board) ^ ": ");
@@ -268,6 +422,12 @@ let rec human_player board =
     human_player board
 ;;
 
+let better_starting_board =
+  match Board.make_move Board.starting_board (Hex.of_row_col_exn ~row:2 ~col:2) with
+  | `Next_board b -> b
+  | _ -> assert false
+;;
+
 let play () =
   let rec go ~x_player ~o_player board =
     print_endline (Board.to_string board);
@@ -279,11 +439,11 @@ let play () =
     match Board.make_move board move with
     | `Invalid_move -> failwith "Invalid move"
     | `Next_board board' -> go ~x_player ~o_player board'
-    | `Move_won board ->
-      print_endline (Board.to_string board);
-      print_endline ("Player " ^ Board.Turn.to_string (Board.turn board) ^ " won!")
+    | `Winner (winner, board) ->
+      print_endline (Board.Won_board.to_string board);
+      print_endline ("Player " ^ Board.Turn.to_string winner ^ " won!")
   in
-  go ~x_player:Board.random_move ~o_player:Board.random_move Board.starting_board
+  go ~x_player:mcts_player ~o_player:mcts_player better_starting_board
 ;;
 
 let main () = play ()
