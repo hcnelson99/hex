@@ -97,9 +97,16 @@ let%expect_test _ =
 module Board : sig
   type t
 
+  module Turn : sig
+    type t =
+      | X
+      | O
+    [@@deriving equal, compare]
+  end
+
   val starting_board : t
   val to_string : t -> string
-  val make_move : t -> Hex.t -> t option
+  val make_move : t -> Hex.t -> [ `Invalid_move | `Next_board of t | `Move_won of t ]
 end = struct
   module Turn = struct
     type t =
@@ -148,14 +155,6 @@ end = struct
     |> String.concat ~sep:"\n"
   ;;
 
-  let make_move { board; turn } hex =
-    match Map.find board hex with
-    | None ->
-      let board = Map.set board ~key:hex ~data:turn in
-      Some { board; turn = Turn.flip turn }
-    | Some _ -> None
-  ;;
-
   let%expect_test _ =
     let example_board =
       { turn = Turn.O
@@ -178,15 +177,17 @@ end = struct
          5          -   -   -   X   - |}]
   ;;
 
-  let has_won { board; turn } =
+  let has_won ~player board =
+    let of_player_color h =
+      match Map.find board h with
+      | Some c -> Turn.equal c player
+      | None -> false
+    in
     let starting_hexes =
-      (match turn with
+      (match player with
       | Turn.X -> List.init board_size ~f:(fun row -> Hex.of_row_col_exn ~row ~col:0)
       | Turn.O -> List.init board_size ~f:(fun col -> Hex.of_row_col_exn ~row:0 ~col))
-      |> List.filter ~f:(fun h ->
-             match Map.find board h with
-             | Some c -> Turn.equal c turn
-             | None -> false)
+      |> List.filter ~f:of_player_color
     in
     let visited = Hex.Set.of_list starting_hexes in
     let rec go (visited, work_list) =
@@ -194,7 +195,7 @@ end = struct
       | [] -> false
       | h :: work_list ->
         let is_target =
-          match turn with
+          match player with
           | X -> Hex.col h = board_size - 1
           | O -> Hex.row h = board_size - 1
         in
@@ -202,10 +203,24 @@ end = struct
         then true
         else (
           let visited = Set.add visited h in
-          let work_list = Hex.adjacent h @ work_list in
+          let unvisited_adjacent =
+            Hex.adjacent h
+            |> List.filter ~f:(fun h -> of_player_color h && not (Set.mem visited h))
+          in
+          let work_list = unvisited_adjacent @ work_list in
           go (visited, work_list))
     in
     go (visited, starting_hexes)
+  ;;
+
+  let make_move { board; turn } hex =
+    match Map.find board hex with
+    | None ->
+      let board = Map.set board ~key:hex ~data:turn in
+      if has_won ~player:turn board
+      then `Move_won { board; turn }
+      else `Next_board { board; turn = Turn.flip turn }
+    | Some _ -> `Invalid_move
   ;;
 end
 
@@ -222,8 +237,13 @@ let play () =
     print_endline (Board.to_string board);
     let move = get_move () in
     match Board.make_move board move with
-    | None -> go board
-    | Some board' -> go board'
+    | `Invalid_move ->
+      print_endline "Invalid move";
+      go board
+    | `Next_board board' -> go board'
+    | `Move_won board ->
+      print_endline (Board.to_string board);
+      print_endline "Player won!"
   in
   go Board.starting_board
 ;;
