@@ -261,11 +261,6 @@ end = struct
            | Some _ -> None)
   ;;
 
-  let random_choice l =
-    let i = Random.int (List.length l) in
-    List.nth_exn l i
-  ;;
-
   let random_move t = List.random_element_exn (moves t)
 end
 
@@ -311,21 +306,52 @@ module MCTS = struct
     }
   ;;
 
-  let max_by_exn l ~score ~greater =
-    let rec go (max, max_score, seen, l) =
+  let splice_exn l i = List.take l i, List.nth_exn l i, List.drop l (i + 1)
+
+  let%expect_test _ =
+    let l = List.init 5 ~f:Fn.id in
+    let print result = print_s [%message (result : int list * int * int list)] in
+    print (splice_exn l 0);
+    print (splice_exn l 3);
+    print (splice_exn l 4);
+    [%expect
+      {|
+      (result (() 0 (1 2 3 4)))
+      (result ((0 1 2) 3 (4)))
+      (result ((0 1 2 3) 4 ())) |}]
+  ;;
+
+  let remove_random_exn l =
+    let length = List.length l in
+    if length = 0
+    then assert false
+    else (
+      let i = Random.int length in
+      let a, x, b = splice_exn l i in
+      x, a @ b)
+  ;;
+
+  let max_by_score_exn l ~score ~cmp =
+    let rec go (maxes, max_score, seen, l) =
       match l with
-      | [] -> max, seen
+      | [] -> maxes, seen
       | x :: l ->
         let score = score x in
-        if greater score max_score
-        then go (x, score, max :: seen, l)
-        else go (max, max_score, x :: seen, l)
+        let compare = cmp score max_score in
+        if compare > 0
+        then go ([ x ], score, maxes @ seen, l)
+        else if compare = 0
+        then go (x :: maxes, max_score, seen, l)
+        else go (maxes, max_score, x :: seen, l)
     in
+    let _x = Int.compare in
     match l with
     | [] -> assert false
     | max :: l ->
       let max_score = score max in
-      go (max, max_score, [], l)
+      let maxes, rest = go ([ max ], max_score, [], l) in
+      let max, max_rest = remove_random_exn maxes in
+      max, max_rest @ rest
   ;;
 
   let rec iterate' { wins; simulations; move; turn; node_data } =
@@ -377,7 +403,7 @@ module MCTS = struct
           + (sqrt (of_int 2) * sqrt (log (of_int simulations) / of_int node.simulations)))
       in
       let best_child, children =
-        max_by_exn children ~score:score_child ~greater:Float.( > )
+        max_by_score_exn children ~score:score_child ~cmp:Float.compare
       in
       let best_child, winner = iterate' best_child in
       ( { wins
@@ -397,7 +423,7 @@ module MCTS = struct
     | MonteCarlo _ -> failwith "Not enough simulations"
     | UpperConfidenceBound { children } ->
       let best_move, _ =
-        max_by_exn children ~score:(fun node -> node.simulations) ~greater:Int.( > )
+        max_by_score_exn children ~score:(fun node -> node.simulations) ~cmp:Int.compare
       in
       best_move.move |> Option.value_exn
   ;;
@@ -405,7 +431,7 @@ end
 
 let mcts_player board =
   let rec go mcts i =
-    if i = 100000 then MCTS.best_move mcts else go (MCTS.iterate mcts) (i + 1)
+    if i = 500000 then MCTS.best_move mcts else go (MCTS.iterate mcts) (i + 1)
   in
   go (MCTS.create board) 0
 ;;
@@ -443,7 +469,7 @@ let play () =
       print_endline (Board.Won_board.to_string board);
       print_endline ("Player " ^ Board.Turn.to_string winner ^ " won!")
   in
-  go ~x_player:mcts_player ~o_player:mcts_player better_starting_board
+  go ~x_player:mcts_player ~o_player:mcts_player Board.starting_board
 ;;
 
 let main () = play ()
